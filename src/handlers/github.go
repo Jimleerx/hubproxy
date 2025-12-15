@@ -69,17 +69,31 @@ func GitHubProxyHandler(c *gin.Context) {
 			c.String(http.StatusForbidden, reason)
 			return
 		}
-	} else {
-		c.String(http.StatusForbidden, "无效输入")
+
+		// 将blob链接转换为raw链接
+		if githubExps[1].MatchString(rawPath) {
+			rawPath = strings.Replace(rawPath, "/blob/", "/raw/", 1)
+		}
+
+		ProxyGitHubRequest(c, rawPath)
 		return
 	}
 
-	// 将blob链接转换为raw链接
-	if githubExps[1].MatchString(rawPath) {
-		rawPath = strings.Replace(rawPath, "/blob/", "/raw/", 1)
+	// 检查是否启用任意URL下载
+	cfg := config.GetConfig()
+	if cfg.Access.AllowAnyURL {
+		// 检查域名访问控制和SSRF安全
+		if allowed, reason := utils.GlobalAccessController.CheckAnyURLAccess(rawPath); !allowed {
+			fmt.Printf("任意URL访问被拒绝 %s: %s\n", rawPath, reason)
+			c.String(http.StatusForbidden, reason)
+			return
+		}
+		// 代理任意URL请求
+		ProxyAnyURLRequest(c, rawPath)
+		return
 	}
 
-	ProxyGitHubRequest(c, rawPath)
+	c.String(http.StatusForbidden, "无效输入")
 }
 
 // CheckGitHubURL 检查URL是否匹配GitHub模式
@@ -222,6 +236,145 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int) {
 				proxyGitHubWithRedirect(c, location, redirectCount+1)
 				return
 			}
+		}
+
+		c.Status(resp.StatusCode)
+
+		// 直接流式转发
+		io.Copy(c.Writer, resp.Body)
+	}
+}
+
+// ProxyAnyURLRequest 代理任意URL请求
+func ProxyAnyURLRequest(c *gin.Context, u string) {
+	proxyAnyURLWithRedirect(c, u, 0)
+}
+
+// proxyAnyURLWithRedirect 带重定向的任意URL代理请求
+func proxyAnyURLWithRedirect(c *gin.Context, u string, redirectCount int) {
+	const maxRedirects = 20
+	if redirectCount > maxRedirects {
+		c.String(http.StatusLoopDetected, "重定向次数过多，可能存在循环重定向")
+		return
+	}
+
+	// 对重定向的URL也进行安全检查
+	if redirectCount > 0 {
+		if allowed, reason := utils.GlobalAccessController.CheckAnyURLAccess(u); !allowed {
+			c.String(http.StatusForbidden, reason)
+			return
+		}
+	}
+
+	req, err := http.NewRequest(c.Request.Method, u, c.Request.Body)
+	if err != nil {
+		c.String(http.StatusInternalServerError, fmt.Sprintf("server error %v", err))
+		return
+	}
+
+	// 复制请求头
+	for key, values := range c.Request.Header {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	req.Header.Del("Host")
+
+	resp, err := utils.GetGlobalHTTPClient().Do(req)
+	if err != nil {
+		c.String(http.StatusInternalServerError, fmt.Sprintf("server error %v", err))
+		return
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("关闭响应体失败: %v\n", err)
+		}
+	}()
+
+	// 检查并处理被阻止的内容类型
+	if c.Request.Method == "GET" {
+		if contentType := resp.Header.Get("Content-Type"); blockedContentTypes[strings.ToLower(strings.Split(contentType, ";")[0])] {
+			c.JSON(http.StatusForbidden, map[string]string{
+				"error":   "Content type not allowed",
+				"message": "检测到网页类型，本服务不支持加速网页，请检查您的链接是否正确。",
+			})
+			return
+		}
+	}
+
+	// 检查文件大小限制
+	cfg := config.GetConfig()
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil && size > cfg.Server.FileSize {
+			c.String(http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("文件过大，限制大小: %d MB", cfg.Server.FileSize/(1024*1024)))
+			return
+		}
+	}
+
+	// 清理安全相关的头
+	resp.Header.Del("Content-Security-Policy")
+	resp.Header.Del("Referrer-Policy")
+	resp.Header.Del("Strict-Transport-Security")
+
+	// 获取真实域名
+	realHost := c.Request.Header.Get("X-Forwarded-Host")
+	if realHost == "" {
+		realHost = c.Request.Host
+	}
+	if !strings.HasPrefix(realHost, "http://") && !strings.HasPrefix(realHost, "https://") {
+		realHost = "https://" + realHost
+	}
+
+	// 处理.sh和.ps1文件的智能处理
+	if strings.HasSuffix(strings.ToLower(u), ".sh") || strings.HasSuffix(strings.ToLower(u), ".ps1") {
+		isGzipCompressed := resp.Header.Get("Content-Encoding") == "gzip"
+
+		processedBody, processedSize, err := utils.ProcessSmart(resp.Body, isGzipCompressed, realHost)
+		if err != nil {
+			fmt.Printf("智能处理失败，回退到直接代理: %v\n", err)
+			processedBody = resp.Body
+			processedSize = 0
+		}
+
+		// 智能设置响应头
+		if processedSize > 0 {
+			resp.Header.Del("Content-Length")
+			resp.Header.Del("Content-Encoding")
+			resp.Header.Set("Transfer-Encoding", "chunked")
+		}
+
+		// 复制其他响应头
+		for key, values := range resp.Header {
+			for _, value := range values {
+				c.Header(key, value)
+			}
+		}
+
+		// 处理重定向
+		if location := resp.Header.Get("Location"); location != "" {
+			proxyAnyURLWithRedirect(c, location, redirectCount+1)
+			return
+		}
+
+		c.Status(resp.StatusCode)
+
+		// 输出处理后的内容
+		if _, err := io.Copy(c.Writer, processedBody); err != nil {
+			return
+		}
+	} else {
+		// 复制响应头
+		for key, values := range resp.Header {
+			for _, value := range values {
+				c.Header(key, value)
+			}
+		}
+
+		// 处理重定向
+		if location := resp.Header.Get("Location"); location != "" {
+			proxyAnyURLWithRedirect(c, location, redirectCount+1)
+			return
 		}
 
 		c.Status(resp.StatusCode)

@@ -203,3 +203,71 @@ func (ac *AccessController) checkList(matches, list []string) bool {
 	}
 	return false
 }
+
+// CheckAnyURLAccess 检查任意URL的访问权限
+func (ac *AccessController) CheckAnyURLAccess(urlStr string) (allowed bool, reason string) {
+	// 首先进行SSRF安全检查
+	if safe, reason := CheckURLSafety(urlStr); !safe {
+		return false, reason
+	}
+
+	// 提取域名
+	domain, err := ExtractDomain(urlStr)
+	if err != nil {
+		return false, "无效的URL格式"
+	}
+
+	cfg := config.GetConfig()
+
+	// 检查域名白名单（如果配置了白名单，只允许白名单中的域名）
+	if len(cfg.Access.DomainWhiteList) > 0 {
+		if !ac.checkDomainInList(domain, cfg.Access.DomainWhiteList) {
+			return false, "域名不在白名单内"
+		}
+	}
+
+	// 检查域名黑名单
+	if len(cfg.Access.DomainBlackList) > 0 {
+		if ac.checkDomainInList(domain, cfg.Access.DomainBlackList) {
+			return false, "域名在黑名单内"
+		}
+	}
+
+	return true, ""
+}
+
+// checkDomainInList 检查域名是否在指定列表中
+func (ac *AccessController) checkDomainInList(domain string, list []string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+
+	for _, item := range list {
+		item = strings.ToLower(strings.TrimSpace(item))
+		if item == "" {
+			continue
+		}
+
+		// 精确匹配
+		if domain == item {
+			return true
+		}
+
+		// 通配符匹配 *.example.com
+		if strings.HasPrefix(item, "*.") {
+			suffix := strings.TrimPrefix(item, "*")
+			// 匹配子域名（如 sub.example.com 匹配 *.example.com）
+			if strings.HasSuffix(domain, suffix) {
+				return true
+			}
+			// 也匹配根域名（如 example.com 匹配 *.example.com）
+			if domain == strings.TrimPrefix(suffix, ".") {
+				return true
+			}
+		}
+
+		// 后缀匹配（如 example.com 匹配所有 *.example.com）
+		if strings.HasSuffix(domain, "."+item) {
+			return true
+		}
+	}
+	return false
+}

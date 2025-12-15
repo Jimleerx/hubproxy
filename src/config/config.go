@@ -39,9 +39,12 @@ type AppConfig struct {
 	} `toml:"security"`
 
 	Access struct {
-		WhiteList []string `toml:"whiteList"`
-		BlackList []string `toml:"blackList"`
-		Proxy     string   `toml:"proxy"`
+		WhiteList       []string `toml:"whiteList"`
+		BlackList       []string `toml:"blackList"`
+		Proxy           string   `toml:"proxy"`
+		AllowAnyURL     bool     `toml:"allowAnyURL"`     // 是否允许任意URL下载
+		DomainWhiteList []string `toml:"domainWhiteList"` // 任意URL的域名白名单
+		DomainBlackList []string `toml:"domainBlackList"` // 任意URL的域名黑名单
 	} `toml:"access"`
 
 	Download struct {
@@ -95,13 +98,19 @@ func DefaultConfig() *AppConfig {
 			BlackList: []string{},
 		},
 		Access: struct {
-			WhiteList []string `toml:"whiteList"`
-			BlackList []string `toml:"blackList"`
-			Proxy     string   `toml:"proxy"`
+			WhiteList       []string `toml:"whiteList"`
+			BlackList       []string `toml:"blackList"`
+			Proxy           string   `toml:"proxy"`
+			AllowAnyURL     bool     `toml:"allowAnyURL"`
+			DomainWhiteList []string `toml:"domainWhiteList"`
+			DomainBlackList []string `toml:"domainBlackList"`
 		}{
-			WhiteList: []string{},
-			BlackList: []string{},
-			Proxy:     "",
+			WhiteList:       []string{},
+			BlackList:       []string{},
+			Proxy:           "",
+			AllowAnyURL:     false,
+			DomainWhiteList: []string{},
+			DomainBlackList: []string{},
 		},
 		Download: struct {
 			MaxImages int `toml:"maxImages"`
